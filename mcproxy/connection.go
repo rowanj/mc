@@ -2,48 +2,78 @@ package mcproxy
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"net"
-	"sync"
 
-	"github.com/rowanj/mcproto"
+	"github.com/rowanj/mc/mcproto"
 )
 
 const bufferSize = 65536
 
-type connectionState byte
+type direction int
 
 const (
-	handshaking connectionState = iota
-	status
-	login
-	play
+	clientToServer direction = iota
+	serverToClient
 )
 
 type connection struct {
-	state  connectionState
 	client *net.TCPConn
 	origin *net.TCPConn
 }
 
 func NewConnection(client *net.TCPConn, origin *net.TCPConn) *connection {
-
+	client.SetNoDelay(true)
 	client.SetReadBuffer(bufferSize)
+	origin.SetNoDelay(true)
 	origin.SetReadBuffer(bufferSize)
 
 	log.Printf("new connection from %v", client.RemoteAddr())
 	return &connection{
-		state:  handshaking,
 		client: client,
 		origin: origin,
 	}
 }
 
-func (c *connection) Run() {
-	var wg sync.WaitGroup
-	go c.handleMessageStream(wg)
-	go c.handleMessageStream(wg)
-	wg.Wait()
+func (c *connection) Run() error {
+
+	clientPackets := make(chan mcproto.PacketData)
+	originPackets := make(chan mcproto.PacketData)
+
+	errors := make(chan error)
+
+	tidy := func() {
+		c.origin.Close()
+		c.client.Close()
+	}
+	go func() {
+		defer tidy()
+		defer close(clientPackets)
+		errors <- c.handleTcpStream(clientToServer, clientPackets)
+	}()
+	go func() {
+		defer tidy()
+		defer close(originPackets)
+		errors <- c.handleTcpStream(serverToClient, originPackets)
+	}()
+
+	go func() {
+		defer tidy()
+		errors <- c.handlePacket(clientToServer, clientPackets)
+	}()
+	go func() {
+		defer tidy()
+		errors <- c.handlePacket(serverToClient, originPackets)
+	}()
+
+	err := <-errors
+
+	for tasks := 4; tasks > 1; tasks-- {
+		<-errors
+	}
+
+	return err
 }
 
 func (c *connection) Close() {
@@ -51,34 +81,66 @@ func (c *connection) Close() {
 	c.origin.Close()
 }
 
-func (c *connection) handleMessageStream(wg sync.WaitGroup) {
-	wg.Add(1)
-	defer wg.Done()
+func (c *connection) handleTcpStream(dir direction, rx chan mcproto.PacketData) error {
+
+	var source *net.TCPConn
+	var idString string
+
+	if dir == clientToServer {
+		source = c.client
+		idString = fmt.Sprintf("<= %v", c.client.RemoteAddr())
+	}
+	if dir == serverToClient {
+		source = c.origin
+		idString = fmt.Sprintf("=> %v", c.client.RemoteAddr())
+	}
+
+	defer log.Printf("%v exiting", idString)
 
 	var buf bytes.Buffer
 	var raw []byte = make([]byte, bufferSize)
 	for {
-		n, readErr := c.client.Read(raw)
+		n, readErr := source.Read(raw)
 		if n == 0 {
-			return
+			return fmt.Errorf("%v connection reset by peer", idString)
 		}
-		log.Printf("received %v bytes from %v", n, c.client.RemoteAddr())
+		// log.Printf("%v %v bytes", idString, n)
 		buf.Write(raw[:n])
 
-		p, packetLen := mcproto.DecodePacket(buf.Bytes())
-		if p != nil {
-			log.Printf("read packet ID %v: %v bytes", p.PacketId(), packetLen)
-			written, writeErr := c.origin.Write(buf.Next(int(packetLen)))
-			if uint64(written) != packetLen {
-				log.Printf("sent %v/%v for %v (%v)", written, packetLen, c.client.RemoteAddr(), writeErr)
+		for buf.Len() > 0 {
+			p := mcproto.ReadPacket(&buf)
+			if buf.Len() > bufferSize {
+				return fmt.Errorf("%v error: too much invalid data", idString)
+
 			}
-		} else {
-			log.Printf("warn: fragment from %v (%v bytes)", c.client.RemoteAddr(), n)
+			if p == nil {
+				break
+			}
+			log.Printf("%v rx %v", idString, p)
+			rx <- p
 		}
 
 		if readErr != nil {
-			log.Printf("error: %v - %v", c.client.RemoteAddr(), readErr)
-			return
+			return fmt.Errorf("%v error: %v", idString, readErr)
 		}
 	}
+}
+
+func (c *connection) handlePacket(dir direction, stream chan mcproto.PacketData) error {
+	defer log.Printf("leaving handlePacket %v", c.client.RemoteAddr())
+	var sink *net.TCPConn
+	if dir == clientToServer {
+		sink = c.origin
+	}
+	if dir == serverToClient {
+		sink = c.client
+	}
+	for p := range stream {
+		err := mcproto.EncodeTo(sink, p)
+		if err != nil {
+			return err
+		}
+		//log.Printf("forwarded %v", p)
+	}
+	return nil
 }

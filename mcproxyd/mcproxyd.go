@@ -4,7 +4,7 @@ import (
 	"log"
 	"net"
 
-	"github.com/rowanj/mcproxy"
+	"github.com/rowanj/mc/mcproxy"
 )
 
 func main() {

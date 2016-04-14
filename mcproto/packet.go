@@ -3,6 +3,9 @@ package mcproto
 import (
 	"bytes"
 	"compress/zlib"
+	"encoding/hex"
+	"fmt"
+	"io"
 	"io/ioutil"
 
 	"github.com/golang/protobuf/proto"
@@ -26,34 +29,56 @@ func (p *packetData) Data() []byte {
 	return p.data
 }
 
-func DecodePacket(source []byte) (PacketData, uint64) {
-	packetLen, packetLenLen := proto.DecodeVarint(source)
-	if packetLenLen <= 0 {
-		return nil, 0
+func (p *packetData) String() string {
+	count := len(p.data)
+	switch {
+	case count == 0:
+		return fmt.Sprintf("PacketData(%v, %v bytes)", p.packetId, count)
+	case count <= 20:
+		return fmt.Sprintf("PacketData(%v, %v bytes: [%v])", p.packetId, count, hex.EncodeToString(p.data[:count]))
 	}
-	packetEnd := uint64(packetLenLen) + packetLen
-	if packetEnd > uint64(len(source)) {
-		return nil, 0
+	return fmt.Sprintf("PacketData(%v, %v bytes: [%v...])", p.packetId, count, hex.EncodeToString(p.data[:20]))
+}
+
+func EncodeTo(w io.Writer, p PacketData) error {
+	var buf bytes.Buffer
+
+	_, encodeIdErr := buf.Write(proto.EncodeVarint(p.PacketId()))
+	if encodeIdErr != nil {
+		return encodeIdErr
+	}
+	_, writeErr := buf.Write(p.Data())
+	if writeErr != nil {
+		return writeErr
 	}
 
-	id, idLen := proto.DecodeVarint(source[packetLenLen:])
+	return WriteLengthPrefixedTo(w, buf.Bytes())
+}
+
+func ReadPacket(source *bytes.Buffer) PacketData {
+	payload, bytesRead := ReadLengthPrefixedFrom(source)
+	if bytesRead == 0 {
+		return nil
+	}
+
+	id, idLen := proto.DecodeVarint(payload)
 	if idLen <= 0 {
-		return nil, 0
+		return nil
 	}
 
 	return &packetData{
 		packetId: id,
-		data:     source[packetLenLen+idLen : packetEnd],
-	}, packetEnd
+		data:     payload[idLen:],
+	}
 }
 
-func InflatePacket(source []byte) (PacketData, uint64) {
-	packetLen, packetLenLen := proto.DecodeVarint(source)
-	if packetLenLen <= 0 {
+func InflatePacket(source []byte) (PacketData, int) {
+	payloadLen, payloadLenLen := proto.DecodeVarint(source)
+	if payloadLenLen <= 0 {
 		return nil, 0
 	}
-	end := uint64(packetLenLen) + packetLen
-	if end > uint64(len(source)) {
+	end := payloadLenLen + int(payloadLen)
+	if end > len(source) {
 		return nil, 0
 	}
 
@@ -62,22 +87,22 @@ func InflatePacket(source []byte) (PacketData, uint64) {
 		return nil, 0
 	}
 
-	payloadStart := packetLenLen + dataLenLen
+	blobStart := payloadLenLen + dataLenLen
 
 	var packetId uint64
 	var data []byte
 	if dataLen == 0 {
 		// packet is actually uncompressed
-		dataLen = packetLen - uint64(dataLenLen)
+		dataLen = payloadLen - uint64(dataLenLen)
 
 		var packetIdLen int
-		packetId, packetIdLen = proto.DecodeVarint(source[payloadStart:end])
+		packetId, packetIdLen = proto.DecodeVarint(source[blobStart:end])
 		if packetIdLen <= 0 {
 			return nil, 0
 		}
-		data = source[payloadStart+packetIdLen : end]
+		data = source[blobStart+packetIdLen : end]
 	} else {
-		r, err := zlib.NewReader(bytes.NewReader(data[payloadStart:end]))
+		r, err := zlib.NewReader(bytes.NewReader(data[blobStart:end]))
 		if err != nil {
 			return nil, 0
 		}
