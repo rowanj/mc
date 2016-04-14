@@ -11,65 +11,69 @@ import (
 
 const bufferSize = 65536
 
-type direction int
-
-const (
-	clientToServer direction = iota
-	serverToClient
-)
-
 type connection struct {
 	client *net.TCPConn
+
+	clientIn  chan mcproto.PacketData
+	clientOut chan mcproto.PacketData
+
 	origin *net.TCPConn
+
+	originIn  chan mcproto.PacketData
+	originOut chan mcproto.PacketData
 }
 
 func NewConnection(client *net.TCPConn, origin *net.TCPConn) *connection {
-	client.SetNoDelay(true)
-	client.SetReadBuffer(bufferSize)
-	origin.SetNoDelay(true)
-	origin.SetReadBuffer(bufferSize)
+	setupConnection := func(c *net.TCPConn) {
+		c.SetNoDelay(true)
+		c.SetReadBuffer(bufferSize)
+	}
+	setupConnection(client)
+	setupConnection(origin)
 
-	log.Printf("new connection from %v", client.RemoteAddr())
 	return &connection{
-		client: client,
-		origin: origin,
+		client:    client,
+		clientIn:  make(chan mcproto.PacketData),
+		clientOut: make(chan mcproto.PacketData),
+
+		origin:    origin,
+		originIn:  make(chan mcproto.PacketData),
+		originOut: make(chan mcproto.PacketData),
 	}
 }
 
 func (c *connection) Run() error {
 
-	clientPackets := make(chan mcproto.PacketData)
-	originPackets := make(chan mcproto.PacketData)
-
 	errors := make(chan error)
 
-	tidy := func() {
-		c.origin.Close()
-		c.client.Close()
+	clientAddr := c.client.RemoteAddr()
+
+	// read incoming packets from network
+	packetReader := func(r *net.TCPConn, queue chan mcproto.PacketData, idString string) {
+		defer c.Close()
+		defer close(queue)
+		errors <- c.readTcpPackets(r, queue, idString)
 	}
+	go packetReader(c.client, c.clientIn, fmt.Sprintf("<- %v", clientAddr))
+	go packetReader(c.origin, c.originIn, fmt.Sprintf("-> %v", clientAddr))
+
+	// handle read packets
 	go func() {
-		defer tidy()
-		defer close(clientPackets)
-		errors <- c.handleTcpStream(clientToServer, clientPackets)
-	}()
-	go func() {
-		defer tidy()
-		defer close(originPackets)
-		errors <- c.handleTcpStream(serverToClient, originPackets)
+		defer close(c.clientOut)
+		defer close(c.originOut)
+		errors <- c.handlePackets()
 	}()
 
-	go func() {
-		defer tidy()
-		errors <- c.handlePacket(clientToServer, clientPackets)
-	}()
-	go func() {
-		defer tidy()
-		errors <- c.handlePacket(serverToClient, originPackets)
-	}()
+	// write packets to network
+	packetWriter := func(queue chan mcproto.PacketData, sink *net.TCPConn, idString string) {
+		errors <- c.writeTcpPackets(queue, sink, idString)
+	}
+	go packetWriter(c.originOut, c.origin, fmt.Sprintf("<= %v", clientAddr))
+	go packetWriter(c.clientOut, c.client, fmt.Sprintf("=> %v", clientAddr))
 
 	err := <-errors
-
-	for tasks := 4; tasks > 1; tasks-- {
+	// sync up
+	for tasks := 5; tasks > 1; tasks-- {
 		<-errors
 	}
 
@@ -81,28 +85,17 @@ func (c *connection) Close() {
 	c.origin.Close()
 }
 
-func (c *connection) handleTcpStream(dir direction, rx chan mcproto.PacketData) error {
-
-	var source *net.TCPConn
-	var idString string
-
-	if dir == clientToServer {
-		source = c.client
-		idString = fmt.Sprintf("<= %v", c.client.RemoteAddr())
-	}
-	if dir == serverToClient {
-		source = c.origin
-		idString = fmt.Sprintf("=> %v", c.client.RemoteAddr())
-	}
-
-	defer log.Printf("%v exiting", idString)
+func (c *connection) readTcpPackets(source *net.TCPConn, rx chan mcproto.PacketData, idString string) error {
+	defer source.Close()
+	defer log.Printf("%v closed TCP", idString)
 
 	var buf bytes.Buffer
 	var raw []byte = make([]byte, bufferSize)
 	for {
 		n, readErr := source.Read(raw)
 		if n == 0 {
-			return fmt.Errorf("%v connection reset by peer", idString)
+			rx <- nil
+			return fmt.Errorf("%v connection reset by peer", source.RemoteAddr())
 		}
 		// log.Printf("%v %v bytes", idString, n)
 		buf.Write(raw[:n])
@@ -111,7 +104,6 @@ func (c *connection) handleTcpStream(dir direction, rx chan mcproto.PacketData) 
 			p := mcproto.ReadPacket(&buf)
 			if buf.Len() > bufferSize {
 				return fmt.Errorf("%v error: too much invalid data", idString)
-
 			}
 			if p == nil {
 				break
@@ -126,21 +118,19 @@ func (c *connection) handleTcpStream(dir direction, rx chan mcproto.PacketData) 
 	}
 }
 
-func (c *connection) handlePacket(dir direction, stream chan mcproto.PacketData) error {
-	defer log.Printf("leaving handlePacket %v", c.client.RemoteAddr())
-	var sink *net.TCPConn
-	if dir == clientToServer {
-		sink = c.origin
-	}
-	if dir == serverToClient {
-		sink = c.client
-	}
+func (c *connection) writeTcpPackets(stream chan mcproto.PacketData, sink *net.TCPConn, idString string) error {
+	defer sink.Close()
+	defer log.Printf("%v closed TCP", idString)
+
 	for p := range stream {
+		if p == nil {
+			return nil
+		}
 		err := mcproto.EncodeTo(sink, p)
 		if err != nil {
 			return err
 		}
-		//log.Printf("forwarded %v", p)
+		log.Printf("%v tx %v", idString, p)
 	}
 	return nil
 }

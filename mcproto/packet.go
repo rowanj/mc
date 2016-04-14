@@ -11,6 +11,13 @@ import (
 	"github.com/golang/protobuf/proto"
 )
 
+type Direction int
+
+const (
+	ClientBound Direction = iota
+	ServerBound
+)
+
 type PacketData interface {
 	PacketId() uint64
 	Data() []byte

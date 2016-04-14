@@ -40,17 +40,28 @@ func (s *Server) Run() error {
 	}
 }
 
+func (s *Server) Close() {
+	if s == nil {
+		return
+	}
+	s.listener.Close()
+}
+
 func (s *Server) handleConnection(client *net.TCPConn) {
+	clientAddr := client.RemoteAddr()
+	log.Printf("<- %v connected", clientAddr)
+
 	origin, originErr := net.DialTCP("tcp", nil, s.originAddr)
 	if originErr != nil {
-		log.Printf("Cannot connect to origin server %v: %v", s.originAddr, originErr)
+		log.Printf("<= %v cannot connect to origin server %v: %v", clientAddr, s.originAddr, originErr)
 		client.Close()
 		return
 	}
+	log.Printf("** %v <==> %v connected", clientAddr, origin.RemoteAddr())
 
 	con := NewConnection(client, origin)
 	runErr := con.Run()
 	con.Close()
 
-	log.Printf("%v (connection closed)", runErr)
+	log.Printf("** %v <==> %v disconnected: %v", clientAddr, origin.RemoteAddr(), runErr)
 }
